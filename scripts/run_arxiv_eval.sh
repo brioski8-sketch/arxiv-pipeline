@@ -1,6 +1,6 @@
 #!/bin/bash
 # Cron wrapper: evaluate interests (runs 1st and 15th)
-cd /home/thebevans/.hermes/datasets/arxiv
+cd "$HOME/.hermes/datasets/arxiv"
 
 python3 evaluate_interests.py > /tmp/arxiv_interest_eval.txt 2>&1
 STATUS=$?

@@ -36,7 +36,7 @@ MARKER_FILE = os.path.join(BASE_DIR, ".last_influential")
 MIN_DAYS_BETWEEN = 7
 RELEVANCE_RESULTS = 25      # arXiv relevance hits to scan per query
 KEEP_PER_QUERY = 6          # most-cited kept per query
-MAILTO = "brioski8@gmail.com"
+MAILTO = os.environ.get("ARXIV_MAILTO", "")
 
 NS = {
     "atom": "http://www.w3.org/2005/Atom",

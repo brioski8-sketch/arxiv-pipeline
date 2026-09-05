@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pull new papers from Arxiv API on topics relevant to Brian's work.
+Pull new papers from Arxiv API on topics relevant to the analyst's interests.
 Search queries loaded from queries.json for easy external editing.
 Runs via cron. Deduplicates by arxiv_id.
 """

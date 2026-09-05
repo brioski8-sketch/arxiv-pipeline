@@ -1,6 +1,6 @@
 #!/bin/bash
 # Cron wrapper: update arxiv DB, generate report
-cd /home/thebevans/.hermes/datasets/arxiv
+cd "$HOME/.hermes/datasets/arxiv"
 
 # Step 1: Pull new papers
 python3 update_arxiv.py > /tmp/arxiv_pull_log.txt 2>&1
@@ -15,7 +15,7 @@ python3 generate_report.py > /tmp/arxiv_report_log.txt 2>&1
 REPORT_STATUS=$?
 
 # Step 3: Read the short report and combine with summary
-SHORT_REPORT=$(cat /home/thebevans/.hermes/datasets/arxiv/reports/short_$(date +%Y-%m-%d).txt 2>/dev/null)
+SHORT_REPORT=$(cat "$HOME/.hermes/datasets/arxiv"/reports/short_$(date +%Y-%m-%d).txt 2>/dev/null)
 
 echo "=== Arxiv Pipeline Run: $(date) ==="
 echo "Pull: ${PULL_STATUS} $(tail -1 /tmp/arxiv_pull_log.txt 2>/dev/null)"
@@ -24,4 +24,4 @@ echo "Report: ${REPORT_STATUS} $(tail -1 /tmp/arxiv_report_log.txt 2>/dev/null)"
 echo ""
 echo "${SHORT_REPORT}"
 echo ""
-echo "Full report: /home/thebevans/.hermes/datasets/arxiv/reports/arxiv_briefing_$(date +%Y-%m-%d).md"
+echo "Full report: $HOME/.hermes/datasets/arxiv/reports/arxiv_briefing_$(date +%Y-%m-%d).md"

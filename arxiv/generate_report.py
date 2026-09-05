@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate personalized Arxiv research briefing for Brian.
+Generate the personalized Arxiv research briefing.
 Score papers using the 7-category relevance engine from INTERESTS.md.
 Enriches citation data from Semantic Scholar at report time.
 """
