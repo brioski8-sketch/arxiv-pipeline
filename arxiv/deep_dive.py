@@ -33,6 +33,11 @@ TEMP_DIR = "/tmp"
 # Config
 # ---------------------------------------------------------------------------
 FULL_TEXT_SAMPLE_CHARS = 3000
+
+# API etiquette: identify the client with a contact address (arXiv asks for this
+# for automated clients; anonymous/bulk PDF pulls are throttled).
+MAILTO = os.environ.get("ARXIV_MAILTO") or "agentvi@agentmail.to"
+USER_AGENT = f"HermesArxivBriefing/1.0 (DeepDive; mailto:{MAILTO})"
 KEY_FINDING_PATTERNS = [
     r"we show",
     r"our results",
@@ -93,7 +98,7 @@ def download_pdf(pdf_url: str, dest: str) -> bool:
     try:
         req = urllib.request.Request(
             pdf_url,
-            headers={"User-Agent": "HermesAgent/1.0 (DeepDive)"},
+            headers={"User-Agent": USER_AGENT},
         )
         with urllib.request.urlopen(req, timeout=60) as resp:
             with open(dest, "wb") as f:

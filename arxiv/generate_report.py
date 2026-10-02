@@ -20,30 +20,33 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "arxiv_papers.db")
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "reports")
 LAST_RUN_FILE = os.path.join(os.path.dirname(__file__), ".last_report")
 
+# Size of the briefing window, in days, counted back from midnight today. The
+# pipeline runs weekly, so this must span a full week of ingestion — a narrower
+# window silently drops papers that were pulled during the previous run.
+REPORT_WINDOW_DAYS = 7
+
+# API etiquette: identify the client with a contact address. OpenAlex grants its
+# "polite pool" (better rate limits) when a mailto is supplied; Semantic Scholar
+# and arXiv expect the same courtesy. Anonymous clients are throttled first.
+MAILTO = os.environ.get("ARXIV_MAILTO") or "agentvi@agentmail.to"
+USER_AGENT = f"HermesArxivBriefing/1.0 (mailto:{MAILTO})"
+
 
 def get_last_report_cutoff():
-    """Determine cutoff timestamp: only report papers ingested since the last briefing.
-    
-    Uses the most recent short_*.txt report file's date. If no report exists,
-    falls back to 48 hours ago. Creates/updates .last_report marker for precision.
+    """Cutoff timestamp for this briefing: rolling start-of-day, 7 days back.
+
+    "Since last report" is NOT meant literally. This is a weekly job, so the
+    window is always the past REPORT_WINDOW_DAYS days counted from midnight —
+    that is what captures everything new during the week.
+
+    Deliberately does NOT read the .last_report marker. That marker is stamped at
+    the END of a run, so using it as the cutoff collapses the window to seconds:
+    the report then says "no new papers" even though a full week's worth were
+    just pulled, and a manual re-run cannot backfill a missed briefing. The
+    marker is still written for other tooling, but it never sets the window.
     """
-    marker = LAST_RUN_FILE
-    if os.path.exists(marker):
-        with open(marker) as f:
-            ts = f.read().strip()
-            if ts:
-                return ts
-    
-    # Fallback: find most recent report filename
-    reports = sorted(glob.glob(os.path.join(OUTPUT_DIR, "short_*.txt")), reverse=True)
-    if reports:
-        # Extract date from short_YYYY-MM-DD.txt — use start-of-day as cutoff
-        m = re.search(r'short_(\d{4}-\d{2}-\d{2})\.txt', reports[0])
-        if m:
-            return m.group(1) + "T00:00:00"
-    
-    # First run ever — last 48 hours
-    return (datetime.datetime.now() - datetime.timedelta(hours=48)).isoformat()
+    cutoff_day = (datetime.datetime.now() - datetime.timedelta(days=REPORT_WINDOW_DAYS)).date()
+    return datetime.datetime.combine(cutoff_day, datetime.time.min).isoformat()
 
 # ── 7-Category Relevance Scoring Engine (from INTERESTS.md) ──────────────────
 
@@ -139,7 +142,7 @@ def fetch_semantic_scholar(arxiv_id):
     """Fetch citation data from Semantic Scholar API for a paper."""
     url = f"https://api.semanticscholar.org/graph/v1/paper/arXiv:{arxiv_id}?fields=citationCount,influentialCitationCount"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "HermesArxivBriefing/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
         return {
@@ -161,9 +164,9 @@ def fetch_openalex(arxiv_id):
     """Fetch citation count from OpenAlex (free, no rate limit).
     Uses DOI format: 10.48550/arXiv.{arxiv_id}
     """
-    url = f"https://api.openalex.org/works/doi:10.48550/arXiv.{arxiv_id}?select=cited_by_count"
+    url = f"https://api.openalex.org/works/doi:10.48550/arXiv.{arxiv_id}?select=cited_by_count&mailto={MAILTO}"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "HermesArxivBriefing/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
         c = data.get("cited_by_count", 0) or 0

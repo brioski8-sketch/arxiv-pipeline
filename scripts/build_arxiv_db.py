@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
-"""Build a local SQLite database of arXiv preprints related to criminal justice."""
+"""Build a local SQLite database of arXiv preprints related to criminal justice.
 
+.. deprecated::
+    SUPERSEDED by the maintained pipeline in ``~/.hermes/datasets/arxiv/``
+    (``update_arxiv.py`` + ``update_influential.py`` + ``generate_report.py``,
+    driven by cron job ``aaa298d8bf41`` via ``run_arxiv_pipeline.sh``).
+    Nothing scheduled calls this script — it is kept only for reference.
+
+    If you DO run it, it now follows the arXiv Terms of Use
+    (https://info.arxiv.org/help/api/tou.html): identifying mailto in the query
+    and User-Agent, >=3s between requests, and no retry-storming on 429.
+    It previously slept 0.5s ("be nice to arXiv") — that was 6x over the limit
+    and a genuine way to earn a rate-limit block.
+"""
+
+import urllib.error
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -30,6 +44,13 @@ SEARCH_QUERIES = [
     "legal+reasoning+NLP",
 ]
 
+# --- arXiv API etiquette (https://info.arxiv.org/help/api/tou.html) ---
+# Identify with a contact address; keep to <=1 request per 3 seconds.
+MAILTO = os.environ.get("ARXIV_MAILTO") or "agentvi@agentmail.to"
+USER_AGENT = f"HermesArxivBriefing/1.0 (mailto:{MAILTO})"
+REQUEST_DELAY = 3.5
+HTTP_TIMEOUT = 20
+
 NS = {
     "atom": "http://www.w3.org/2005/Atom",
     "arxiv": "http://arxiv.org/schemas/atom",
@@ -37,12 +58,20 @@ NS = {
 }
 
 def fetch_arxiv(query, max_results=10):
-    """Search arXiv API for a given query."""
-    url = f"http://export.arxiv.org/api/query?search_query=all:{query}&start=0&max_results={max_results}&sortBy=submittedDate&sortOrder=descending"
-    time.sleep(0.5)  # Be nice to arXiv
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return resp.read().decode()
+    """Search the arXiv API for a given query (ToU-compliant: mailto + >=3s spacing)."""
+    url = (
+        f"https://export.arxiv.org/api/query?search_query=all:{query}"
+        f"&start=0&max_results={max_results}&sortBy=submittedDate&sortOrder=descending"
+        f"&mailto={urllib.parse.quote(MAILTO)}"
+    )
+    time.sleep(REQUEST_DELAY)  # arXiv ToU: no more than one request every 3 seconds
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            return resp.read().decode()
+    except urllib.error.HTTPError as e:
+        # Do NOT retry-storm a 429: that is the behaviour the ToU warns about.
+        raise RuntimeError(f"arXiv HTTP {e.code} (rate limited?)") from e
 
 def parse_entry(entry):
     """Parse an arXiv Atom entry into a dict."""

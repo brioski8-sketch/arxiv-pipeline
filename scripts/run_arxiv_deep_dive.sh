@@ -1,10 +1,11 @@
 #!/bin/bash
 # Cron wrapper: run deep dive on the highest-scoring undived paper
-cd "$HOME/.hermes/datasets/arxiv"
+cd $HOME/.hermes/datasets/arxiv
 
-# Use python3 (system default) — pymupdf (fitz) is installed there.
-# python3.12 lost fitz after an update; using it silently skips full-text extraction.
-python3 deep_dive.py > /tmp/arxiv_deep_dive_log.txt 2>&1
+# Use the ABSOLUTE system interpreter — pymupdf (fitz) is installed there.
+# A bare `python3` resolves to the Hermes venv under cron, which has no fitz and
+# silently skips full-text extraction. /usr/bin/python3 has pymupdf installed.
+/usr/bin/python3 deep_dive.py > /tmp/arxiv_deep_dive_log.txt 2>&1
 STATUS=$?
 
 echo "=== Arxiv Deep Dive: $(date) === "
