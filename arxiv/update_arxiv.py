@@ -6,6 +6,7 @@ Runs via cron. Deduplicates by arxiv_id.
 """
 
 import sqlite3
+import re
 import time
 import urllib.error
 import urllib.request
@@ -63,6 +64,27 @@ def load_queries():
         queries = json.load(f)
     print(f"Loaded {len(queries)} search queries")
     return queries
+
+
+def canonical_arxiv_id(raw_id: str):
+    """Split a raw arXiv <id> into the canonical bare id and its version.
+
+        'http://arxiv.org/abs/2403.12108v3'  -> ('2403.12108', 3)
+        'https://arxiv.org/abs/hep-th/0601001' -> ('hep-th/0601001', None)
+        '2403.12108'                         -> ('2403.12108', None)
+
+    `arxiv_id` is a UNIQUE key, so it must hold the bare id with the version kept in
+    its own column. Keeping the version inside the key makes a later arXiv version
+    insert a DUPLICATE row for the same paper instead of updating the existing one
+    (measured 2026-10-05: 45 such duplicate pairs). A DB trigger rejects any
+    non-canonical value written to papers.arxiv_id, so this must run before insert.
+    """
+    raw_id = (raw_id or "").strip()
+    m = re.search(r"v(\d+)$", raw_id)
+    version = int(m.group(1)) if m else None
+    aid = re.sub(r"^https?://arxiv\.org/abs/", "", raw_id)
+    aid = re.sub(r"v\d+$", "", aid)
+    return aid, version
 
 
 def fetch_arxiv(query_name, query_string, max_results=MAX_RESULTS_PER_QUERY):
@@ -137,7 +159,9 @@ def fetch_arxiv(query_name, query_string, max_results=MAX_RESULTS_PER_QUERY):
     
     papers = []
     for entry in root.findall("atom:entry", ns):
-        arxiv_id = entry.find("atom:id", ns).text.strip()
+        # The Atom <id> is a full URL that carries a version; canonicalise it.
+        raw_id = entry.find("atom:id", ns).text.strip()
+        arxiv_id, version = canonical_arxiv_id(raw_id)
         title = entry.find("atom:title", ns).text.strip().replace("\n", " ").replace("\r", "")
         published = entry.find("atom:published", ns).text.strip()[:10] if entry.find("atom:published", ns) is not None else ""
         updated = entry.find("atom:updated", ns).text.strip()[:10] if entry.find("atom:updated", ns) is not None else ""
@@ -160,6 +184,7 @@ def fetch_arxiv(query_name, query_string, max_results=MAX_RESULTS_PER_QUERY):
         
         papers.append({
             "arxiv_id": arxiv_id,
+            "version": version,
             "title": title,
             "published": published,
             "updated": updated,
@@ -186,8 +211,8 @@ def store_papers(conn, papers):
         if p["arxiv_id"] in existing:
             continue
         c.execute(
-            """INSERT INTO papers (arxiv_id, title, published, updated, summary, authors, links, categories, search_query, ingested_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO papers (arxiv_id, title, published, updated, summary, authors, links, categories, search_query, ingested_at, version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 p["arxiv_id"],
                 p["title"],
@@ -199,6 +224,7 @@ def store_papers(conn, papers):
                 p["categories"],
                 p["search_query"],
                 datetime.datetime.now().isoformat(),
+                p.get("version"),
             ),
         )
         new_count += 1
@@ -231,7 +257,8 @@ def main():
         links TEXT,
         categories TEXT,
         search_query TEXT,
-        ingested_at TEXT
+        ingested_at TEXT,
+        version INTEGER
     )""")
     conn.commit()
     

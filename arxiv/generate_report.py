@@ -32,6 +32,98 @@ MAILTO = os.environ.get("ARXIV_MAILTO") or "agentvi@agentmail.to"
 USER_AGENT = f"HermesArxivBriefing/1.0 (mailto:{MAILTO})"
 
 
+# ── "Reported once, never again" ledger ──────────────────────────────────────
+# A paper that has appeared in a briefing must not appear in a later one. Without
+# this, the static no-window queries — the all-time top-cited list especially —
+# print identical papers in EVERY briefing. Measured 2026-10-05: the same five
+# papers, all with ingested_at of 2026-08-02, appeared verbatim in the 21 Sep,
+# 28 Sep and 5 Oct briefings, and "A Collection of Definitions of Intelligence"
+# (arXiv 0706.3639) was in every one of them.
+#
+# Keyed on arxiv_id, which is UNIQUE in `papers`. A separate table rather than a
+# new column on `papers`, so this can be inspected, seeded and cleared on its own
+# without touching the ingestion schema.
+LEDGER_TABLE = "reported_papers"
+
+
+def ensure_ledger(conn) -> None:
+    conn.execute(f"""CREATE TABLE IF NOT EXISTS {LEDGER_TABLE} (
+        arxiv_id          TEXT PRIMARY KEY,
+        first_reported_at TEXT,
+        last_report_date  TEXT,
+        times_reported    INTEGER DEFAULT 1)""")
+    conn.commit()
+
+
+def load_reported(conn, before: str | None = None) -> set:
+    """arxiv_ids already reported, optionally only those reported BEFORE a date.
+
+    `before` exists to make a same-day re-run idempotent. The briefing is generated
+    TWICE per run: once by run_arxiv_pipeline.sh, then again by the cron prompt's
+    Step 1 (`python3 generate_report.py`). Without this, the second run would treat
+    everything the first run just displayed as already-reported, suppress all of it,
+    and overwrite the briefing with an empty report — leaving the podcast nothing to
+    cover. Passing today's date means only PREVIOUS days suppress.
+    """
+    ensure_ledger(conn)
+    try:
+        if before:
+            return {r[0] for r in conn.execute(
+                f"SELECT arxiv_id FROM {LEDGER_TABLE} "
+                f"WHERE last_report_date IS NULL OR last_report_date < ?", (before,))}
+        return {r[0] for r in conn.execute(f"SELECT arxiv_id FROM {LEDGER_TABLE}")}
+    except sqlite3.Error:
+        return set()
+
+
+def arxiv_url(paper) -> str:
+    """Canonical link for a paper.
+
+    `arxiv_id` is a bare id (no URL, no version), so the link must be constructed.
+    Before the id was normalised these columns held a full URL, and rendering the id
+    straight into an href produced plain text instead of a working link. `abs/<id>`
+    resolves to the latest version.
+    """
+    aid = (paper.get("arxiv_id") or "").strip()
+    return f"https://arxiv.org/abs/{aid}" if aid else ""
+
+
+def record_reported(conn, papers, report_date: str) -> int:
+    """Mark papers as reported; returns the number of DISTINCT papers written.
+
+    A paper listed twice in one briefing (it can appear in two sections) counts
+    once. A ledger failure must never lose the report, so each write is guarded.
+    """
+    ensure_ledger(conn)
+    distinct = []
+    seen = set()
+    for p in papers:
+        aid = (p.get("arxiv_id") or "").strip()
+        if aid and aid not in seen:
+            seen.add(aid)
+            distinct.append(aid)
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    written = 0
+    for aid in distinct:
+        try:
+            conn.execute(
+                f"""INSERT INTO {LEDGER_TABLE}
+                        (arxiv_id, first_reported_at, last_report_date, times_reported)
+                    VALUES (?, ?, ?, 1)
+                    ON CONFLICT(arxiv_id) DO UPDATE SET
+                        last_report_date = excluded.last_report_date,
+                        times_reported   = CASE
+                            WHEN last_report_date = excluded.last_report_date
+                            THEN times_reported
+                            ELSE times_reported + 1 END""",
+                (aid, now, report_date))
+            written += 1
+        except sqlite3.Error:
+            continue
+    conn.commit()
+    return written
+
+
 def get_last_report_cutoff():
     """Cutoff timestamp for this briefing: rolling start-of-day, 7 days back.
 
@@ -320,8 +412,16 @@ def generate_report():
     
     # ── Step 3: Get NEW papers (since last report) for scoring ──
     print("Step 2: Scoring new papers with 7-category relevance engine...")
+    # Report once, never again: anything already reported on a PREVIOUS day is
+    # excluded from every section below, including the static top-cited list.
+    # Today's own reports are exempt so that re-running the generator on the same
+    # day reproduces the same briefing instead of emptying it.
+    reported_ids = load_reported(conn, before=datetime.datetime.now().strftime("%Y-%m-%d"))
     c.execute("SELECT * FROM papers WHERE ingested_at >= ? ORDER BY published DESC, ingested_at DESC", (cutoff,))
     new_papers = [dict(r) for r in c.fetchall()]
+    new_papers = [p for p in new_papers if (p.get("arxiv_id") or "") not in reported_ids]
+    if reported_ids:
+        print(f"  ledger: {len(reported_ids)} paper(s) already reported are suppressed")
     
     # Get full DB stats for context
     c.execute("SELECT MAX(ingested_at) FROM papers")
@@ -338,10 +438,26 @@ def generate_report():
     
     c.execute("SELECT COUNT(*) FROM papers WHERE ingested_at >= ?", (cutoff,))
     recent_count = c.fetchone()[0]
+    # Report what is actually being reported: after the ledger filter, `new_papers`
+    # is the set this briefing covers, so the header stat and the narrative agree.
+    if reported_ids:
+        recent_count = len(new_papers)
     
-    # Top-cited papers (overall)
-    c.execute("SELECT title, arxiv_id, citation_count FROM papers WHERE citation_count > 0 ORDER BY citation_count DESC LIMIT 5")
+    # Notable papers NEW to the DB inside the window, by citation count.
+    # Deliberately window-scoped. The previous version had NO date filter, so it
+    # returned the same all-time leaders every run — the identical five papers, all
+    # ingested 2026-08-02, appeared in the 21 Sep / 28 Sep / 5 Oct briefings. An
+    # all-time citation ranking is a DB statistic, not briefing content, and once
+    # the ledger suppresses what has been reported its remainder is a tail of
+    # 7-citation papers: it would still read as a "top 5" while meaning nothing.
+    # Window-scoped, it can only show genuinely notable recent arrivals, and it is
+    # simply absent when there are none.
+    c.execute(
+        """SELECT title, arxiv_id, citation_count FROM papers
+           WHERE citation_count > 0 AND ingested_at >= ?
+           ORDER BY citation_count DESC LIMIT 60""", (cutoff,))
     top_cited = [dict(r) for r in c.fetchall()]
+    top_cited = [t for t in top_cited if t["arxiv_id"] not in reported_ids][:5]
 
     # New influential-channel papers since cutoff (for the High-Impact section)
     c.execute(
@@ -349,6 +465,7 @@ def generate_report():
         (cutoff,),
     )
     influential_new = [dict(r) for r in c.fetchall()]
+    influential_new = [p for p in influential_new if (p.get("arxiv_id") or "") not in reported_ids]
     
     # ── Step 4: Score and rank only new papers ──
     scored = []
@@ -425,7 +542,7 @@ This briefing covers the {len(new_papers)} papers ingested since the last report
             citations = p.get("citation_count", 0) or 0
             report += f"""**{p['title']}**
 **Published:** {published} | **Citations:** {citations} | **Score:** {s} | **Tags:** `{cats}`
-**Arxiv:** {p['arxiv_id']} | **Topic:** {p['search_query']}
+**Arxiv:** [{p['arxiv_id']}]({arxiv_url(p)}) | **Topic:** {p['search_query']}
 
 {summary_short}
 
@@ -444,7 +561,7 @@ This briefing covers the {len(new_papers)} papers ingested since the last report
             citations = p.get("citation_count", 0) or 0
             report += f"""### {p['title']}
 **Published:** {published} | **Score:** {s} | **Citations:** {citations} | **Tags:** `{cats}`
-**Arxiv:** {p['arxiv_id']} | **Categories:** {p['categories']}
+**Arxiv:** [{p['arxiv_id']}]({arxiv_url(p)}) | **Categories:** {p['categories']}
 
 {summary_short}
 
@@ -461,7 +578,7 @@ This briefing covers the {len(new_papers)} papers ingested since the last report
             citations = p.get("citation_count", 0) or 0
             report += f"""### {p['title']}
 **Published:** {published} | **Score:** {s} | **Citations:** {citations} | **Tags:** `{cats}`
-**Arxiv:** {p['arxiv_id']} | **Categories:** {p['categories']}
+**Arxiv:** [{p['arxiv_id']}]({arxiv_url(p)}) | **Categories:** {p['categories']}
 
 {summary_short}
 
@@ -478,7 +595,7 @@ This briefing covers the {len(new_papers)} papers ingested since the last report
     if new_others:
         report += "\n## 📥 Recently Added (Other Topics)\n\n"
         for p in new_others[:5]:
-            report += f"""- **{p['title']}** — {p['published'][:10]} — *{p['categories']}* — [{p['arxiv_id']}]({p['arxiv_id']})\n"""
+            report += f"""- **{p['title']}** — {p['published'][:10]} — *{p['categories']}* — [{p['arxiv_id']}]({arxiv_url(p)})\n"""
     
     # Save full report
     date_str = datetime.datetime.now().strftime('%Y-%m-%d')
@@ -526,7 +643,17 @@ This briefing covers the {len(new_papers)} papers ingested since the last report
     short_filepath = os.path.join(OUTPUT_DIR, f"short_{date_str}.txt")
     with open(short_filepath, "w") as f:
         f.write(short_report)
-    
+
+    # ── Ledger: everything this briefing DISPLAYED is now reported and must not
+    #    appear again. Only displayed papers are marked — a low-scoring paper that
+    #    was ingested but never surfaced stays eligible to surface in a later run.
+    #    `new_others[:5]` is the "Recently Added (Other Topics)" list, which can
+    #    surface papers in no other section.
+    displayed = (list(top_cited) + list(influential_new)
+                 + list(hot_topics) + list(worth_a_look) + list(new_others[:5]))
+    marked = record_reported(conn, displayed, date_str)
+    print(f"Ledger: marked {marked} paper(s) as reported (they will not repeat)")
+
     conn.close()
     
     # Save marker for next run's cutoff

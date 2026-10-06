@@ -181,10 +181,19 @@ def fetch_cited_count(arxiv_id):
 
 
 def store(conn, papers):
-    """UPSERT: insert new papers as source='influential', backfill citations on existing."""
+    """UPSERT: insert new papers as source='influential', backfill citations on existing.
+
+    Returns (added, updated). Existence is checked BEFORE the upsert on purpose:
+    SQLite reports rowcount == 1 for BOTH branches of INSERT ... ON CONFLICT DO
+    UPDATE, so branching on rowcount silently reported every write as an insert and
+    `updated` was permanently 0.
+    """
     c = conn.cursor()
     added, updated = 0, 0
     for p in papers:
+        existed = c.execute(
+            "SELECT 1 FROM papers WHERE arxiv_id = ?", (p["arxiv_id"],)
+        ).fetchone() is not None
         c.execute(
             """INSERT INTO papers
                (arxiv_id, title, published, updated, summary, authors, links,
@@ -201,10 +210,10 @@ def store(conn, papers):
                 p["citation_count"],
             ),
         )
-        if c.rowcount == 1:
-            added += 1
-        else:
+        if existed:
             updated += 1
+        else:
+            added += 1
     conn.commit()
     return added, updated
 
