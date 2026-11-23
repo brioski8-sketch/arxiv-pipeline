@@ -61,8 +61,8 @@ an exhausted budget, so it 429'd, never finished, and retried the same work week
 A separate Tuesday run gets a clean budget. The script deliberately does not stamp its marker on
 a partial enrichment, so check `.last_influential` before assuming the channel is alive.
 
-The two agent-facing jobs read their instructions from `cronprompts/arxiv-pipeline.md` and
-`cronprompts/arxiv-deep-dive.md`; edit those files, not the cron job.
+The two agent-facing jobs read their instructions from host-local files (`~/.hermes/CronPrompts/`).
+They are deliberately not published: they carry the local delivery paths (Drive folders).
 
 ## Logs
 
