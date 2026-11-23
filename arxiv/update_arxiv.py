@@ -42,7 +42,9 @@ RETRY_BACKOFF = 10            # seconds, scaled by attempt number
 # whole retryable class, not just 429, and abort far later than 3.
 RETRYABLE_STATUS = {406, 408, 425, 429, 500, 502, 503, 504}
 MAX_CONSECUTIVE_FAILURES = 10  # abort only when arXiv is hard-down, not on a hiccup
-PULL_TIME_BUDGET = 240        # wall-clock cap on the pull; retries respect it
+PULL_TIME_BUDGET = 600        # wall-clock cap on the pull; retries respect it
+                              # (28 queries at 3.5s spacing = ~100s; a slow arXiv spell
+                              #  costs 30s/query in retries, so 240s aborted mid-pull)
 
 # Set by main(); lets a retry sleep be clamped so it can never overrun the budget.
 _PULL_DEADLINE = None

@@ -29,6 +29,8 @@ import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
 
+import openalex_client
+
 BASE_DIR = os.path.dirname(__file__)
 DB_PATH = os.path.join(BASE_DIR, "arxiv_papers.db")
 QUERIES_PATH = os.path.join(BASE_DIR, "queries.json")
@@ -55,7 +57,7 @@ MAX_CONSECUTIVE_FAILURES = 10  # abort once arXiv is really down, not on a blip
 # arXiv used to burn ~25 min here and kill the report with it. On overrun we
 # stop enriching, store what we have, and do NOT stamp the marker (so the next
 # run retries) instead of dying.
-TIME_BUDGET = 170
+TIME_BUDGET = 300
 
 # Set by main(); lets a retry sleep be clamped so it can never overrun the budget.
 _DEADLINE = None
@@ -165,21 +167,6 @@ def arxiv_relevance(query_string, max_results=RELEVANCE_RESULTS):
     return papers
 
 
-def fetch_cited_count(arxiv_id):
-    """OpenAlex citation count for an arXiv paper. Returns int or 0."""
-    url = (
-        f"https://api.openalex.org/works/doi:10.48550/arXiv.{arxiv_id}"
-        f"?select=cited_by_count&mailto={MAILTO}"
-    )
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-        return data.get("cited_by_count", 0) or 0
-    except Exception:
-        return 0
-
-
 def store(conn, papers):
     """UPSERT: insert new papers as source='influential', backfill citations on existing.
 
@@ -189,8 +176,18 @@ def store(conn, papers):
     `updated` was permanently 0.
     """
     c = conn.cursor()
-    added, updated = 0, 0
+    added, updated, duplicates = 0, 0, 0
     for p in papers:
+        # A genuine double-submission (same title AND authors under two arXiv
+        # ids) is not catchable by id canonicalisation. Chouldechova 1610.07524
+        # / 1703.00056 is the real example in this DB.
+        dup = c.execute(
+            "SELECT arxiv_id FROM papers WHERE lower(title) = ? AND lower(authors) = ? AND arxiv_id != ?",
+            (p["title"].strip().lower(), p["authors"].strip().lower(), p["arxiv_id"]),
+        ).fetchone()
+        if dup:
+            duplicates += 1
+            continue
         existed = c.execute(
             "SELECT 1 FROM papers WHERE arxiv_id = ?", (p["arxiv_id"],)
         ).fetchone() is not None
@@ -215,7 +212,7 @@ def store(conn, papers):
         else:
             added += 1
     conn.commit()
-    return added, updated
+    return added, updated, duplicates
 
 
 def main():
@@ -272,18 +269,27 @@ def main():
     for qname, hits in hits_by_query.items():
         for h in hits:
             unique.setdefault(h["arxiv_id"], h)
-    print(f"  Enriching {len(unique)} unique papers via OpenAlex "
-          f"(budget {TIME_BUDGET - (time.monotonic() - started):.0f}s)...")
+    print(f"  Enriching {len(unique)} unique papers via OpenAlex in batches of "
+          f"{openalex_client.BATCH} (budget {TIME_BUDGET - (time.monotonic() - started):.0f}s)...")
     skipped = 0
-    for i, (aid, h) in enumerate(unique.items()):
+    ids = list(unique.keys())
+    for start in range(0, len(ids), openalex_client.BATCH):
         if time.monotonic() > deadline:
-            skipped = len(unique) - i
+            skipped = len(ids) - start
             print(f"  Budget reached — skipping citation lookup for the remaining {skipped} papers.")
             break
-        h["citation_count"] = fetch_cited_count(aid)
-        if (i + 1) % 25 == 0:
-            print(f"    ...{i + 1}/{len(unique)}")
-        h["query_name"] = None  # filled below
+        chunk = ids[start:start + openalex_client.BATCH]
+        counts = openalex_client.fetch_batch(chunk, mailto=MAILTO, user_agent=USER_AGENT)
+        if counts is None:
+            skipped = len(ids) - start
+            print(f"  OpenAlex batch failed at {start + 1}/{len(ids)}; leaving the rest unchecked.")
+            break
+        for aid in chunk:
+            # A successful request checked every id in the chunk; absent from
+            # the response means OpenAlex has no record yet -> 0 citations.
+            unique[aid]["citation_count"] = counts.get(aid, 0)
+            unique[aid]["query_name"] = None  # filled below
+        print(f"    ...{min(start + openalex_client.BATCH, len(ids))}/{len(ids)}")
 
     # Unchecked papers stay without a citation_count (NOT 0) so the ranking
     # below can't mistake "never looked up" for "zero citations".
@@ -310,7 +316,7 @@ def main():
             seen_ids.add(h["arxiv_id"])
             deduped.append(h)
 
-    added, updated = store(conn, deduped)
+    added, updated, duplicates = store(conn, deduped)
     conn.close()
 
     if skipped:
@@ -321,10 +327,10 @@ def main():
         with open(MARKER_FILE, "w") as f:
             f.write(datetime.datetime.now().isoformat())
 
-    print(f"\n=== Done. {added} new influential papers added, {updated} existing papers' citations backfilled. ===")
+    print(f"\n=== Done. {added} new influential papers added, {updated} existing papers' citations backfilled, {duplicates} duplicate title(s) skipped. ===")
     print(
         f"ARXIV_INFLUENTIAL_RESULT: added={added} backfilled={updated} failed={failures} "
-        f"queries_run={queries_run} skipped_enrich={skipped} last_error={_LAST_ERROR or 'none'}"
+        f"queries_run={queries_run} skipped_enrich={skipped} duplicates={duplicates} last_error={_LAST_ERROR or 'none'}"
     )
 
 

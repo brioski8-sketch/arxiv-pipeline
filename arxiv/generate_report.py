@@ -16,6 +16,8 @@ import glob
 import urllib.request
 import urllib.error
 
+import openalex_client
+
 DB_PATH = os.path.join(os.path.dirname(__file__), "arxiv_papers.db")
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "reports")
 LAST_RUN_FILE = os.path.join(os.path.dirname(__file__), ".last_report")
@@ -252,68 +254,74 @@ def fetch_semantic_scholar(arxiv_id):
         return None
 
 
-def fetch_openalex(arxiv_id):
-    """Fetch citation count from OpenAlex (free, no rate limit).
-    Uses DOI format: 10.48550/arXiv.{arxiv_id}
+OPENALEX_BATCH = openalex_client.BATCH
+
+
+def fetch_openalex_batch(arxiv_ids):
+    """Citation counts for up to 50 papers in one request (shared client)."""
+    return openalex_client.fetch_batch(arxiv_ids, mailto=MAILTO, user_agent=USER_AGENT)
+
+
+def ensure_citation_column(conn):
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(papers)")}
+    if "last_citation_check" not in cols:
+        conn.execute("ALTER TABLE papers ADD COLUMN last_citation_check TEXT")
+        conn.commit()
+
+
+def enrich_citations(conn, batch_limit=500):
+    """Fill citation counts in OpenAlex batches, rotating through the backlog.
+
+    One request covers 50 papers. A paper is re-checked at most once every 30
+    days (oldest check first), so the same top-scored rows are no longer
+    re-requested every week — that cost 200 HTTP calls per run and starved the
+    lower-scored backlog.
     """
-    url = f"https://api.openalex.org/works/doi:10.48550/arXiv.{arxiv_id}?select=cited_by_count&mailto={MAILTO}"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-        c = data.get("cited_by_count", 0) or 0
-        return {"citation_count": c, "influential_citation_count": 0}
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None
-        return None
-    except (urllib.error.URLError, json.JSONDecodeError, OSError):
-        return None
-
-
-def enrich_citations(conn, batch_limit=200):
-    """Enrich papers with missing citation data.
-
-    Uses OpenAlex (free, no rate limit) as primary source. Falls back to
-    Semantic Scholar for influential citation counts. Only processes
-    up to *batch_limit* papers per run, prioritized by relevance_score.
-    """
+    ensure_citation_column(conn)
     c = conn.cursor()
-    c.execute("SELECT id, arxiv_id, citation_count FROM papers WHERE (citation_count IS NULL OR citation_count = 0) AND relevance_score > 0 ORDER BY relevance_score DESC LIMIT ?", (batch_limit,))
-    papers_to_enrich = [{"id": r[0], "arxiv_id": r[1], "citation_count": r[2]} for r in c.fetchall()]
-    
-    if not papers_to_enrich:
-        print("  [S2] All papers already have citation data. Skipping enrichment.")
+    stale_before = (datetime.datetime.now() - datetime.timedelta(days=30)).isoformat()
+    c.execute(
+        """SELECT id, arxiv_id FROM papers
+           WHERE (citation_count IS NULL OR citation_count = 0)
+             AND relevance_score > 0
+             AND (last_citation_check IS NULL OR last_citation_check < ?)
+           ORDER BY COALESCE(last_citation_check, '') ASC, relevance_score DESC
+           LIMIT ?""",
+        (stale_before, batch_limit),
+    )
+    rows = c.fetchall()
+    if not rows:
+        print("  [OpenAlex] Nothing stale to enrich this run.")
         return
-    
-    print(f"  [S2] Enriching {len(papers_to_enrich)} papers via OpenAlex...")
-    enriched_count = 0
-    
-    for i, paper in enumerate(papers_to_enrich):
-        arxiv_id = discover_arxiv_id(paper["arxiv_id"])
-        if not arxiv_id:
-            c.execute("UPDATE papers SET citation_count = 0 WHERE id = ?", (paper["id"],))
-            continue
-        
-        # OpenAlex primary (no rate limit — can fire fast)
-        result = fetch_openalex(arxiv_id)
-        
-        if result:
-            c.execute(
-                "UPDATE papers SET citation_count = ? WHERE id = ?",
-                (result["citation_count"], paper["id"])
-            )
-            enriched_count += 1
-        else:
-            # Mark as 0 so we don't retry (not in OpenAlex index)
-            c.execute("UPDATE papers SET citation_count = 0 WHERE id = ?", (paper["id"],))
-    
+
+    print(f"  [OpenAlex] Enriching {len(rows)} papers in batches of {OPENALEX_BATCH}...")
+    attempts = batches = found = 0
+    for start in range(0, len(rows), OPENALEX_BATCH):
+        chunk = rows[start:start + OPENALEX_BATCH]
+        ids = [discover_arxiv_id(r[1]) or r[1] for r in chunk]
+        result = fetch_openalex_batch(ids)
+        if result is None:
+            print(f"  [OpenAlex] Request failed at batch {batches + 1}; leaving the rest unstamped.")
+            break
+        stamp = datetime.datetime.now().isoformat()
+        batches += 1
+        for (paper_pk, _raw), arxiv_id in zip(chunk, ids):
+            attempts += 1
+            if arxiv_id in result:
+                c.execute(
+                    "UPDATE papers SET citation_count = ?, last_citation_check = ? WHERE id = ?",
+                    (result[arxiv_id], stamp, paper_pk),
+                )
+                found += 1
+            else:
+                # Not indexed yet: keep 0, but stamp so the rotation moves on.
+                c.execute(
+                    "UPDATE papers SET citation_count = COALESCE(citation_count, 0), "
+                    "last_citation_check = ? WHERE id = ?",
+                    (stamp, paper_pk),
+                )
     conn.commit()
-    
-    # Check remaining
-    c.execute("SELECT COUNT(*) FROM papers WHERE citation_count IS NULL OR citation_count = 0")
-    remaining = c.fetchone()[0]
-    print(f"  [S2] Enriched {enriched_count}/{len(papers_to_enrich)} this run. {remaining} still uncached.")
+    print(f"  [OpenAlex] {found}/{attempts} matched in {batches} request(s).")
 
 
 def score_paper(title, summary, citation_count=0):
@@ -522,9 +530,9 @@ def generate_report():
 - **Search topics tracked:** {query_count}
 - **Date range:** {date_range[0]} to {date_range[1]}
 - **Last update:** {last_update[:19] if last_update else "N/A"}
-- **New since last report:** {recent_count}
+- **New in 7-day window:** {recent_count}
 
-This briefing covers the {len(new_papers)} papers ingested since the last report."""
+This briefing covers the {len(new_papers)} papers ingested in the last {REPORT_WINDOW_DAYS} days that have not been reported before."""
 
     # Top-cited papers section
     if top_cited:
@@ -662,7 +670,7 @@ This briefing covers the {len(new_papers)} papers ingested since the last report
     
     print(f"\nReport saved: {filepath}")
     print(f"Short version: {short_filepath}")
-    print(f"\nSummary: {len(hot_topics)} hot topics (8+), {len(worth_a_look)} worth a look (4-7), {recent_count} new")
+    print(f"\nSummary: {len(hot_topics)} hot topics (8+), {len(worth_a_look)} worth a look (4-7), {recent_count} in 7-day window")
     print(f"Top-cited paper: {top_cited[0]['title'][:60] if top_cited else 'N/A'} ({top_cited[0]['citation_count']} citations)" if top_cited else "")
 
 

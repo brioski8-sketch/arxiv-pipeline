@@ -16,8 +16,8 @@ set -uo pipefail
 
 cd "$HOME/.hermes/datasets/arxiv" || exit 2
 
-LOG_DIR="$HOME/.hermes/cache/scratch"
-LOG="$LOG_DIR/arxiv_interest_eval.log"
+LOG_DIR="$HOME/.hermes/logs/arxiv"
+LOG="$LOG_DIR/interest_eval.log"
 mkdir -p "$LOG_DIR"
 
 OUTPUT=$(python3 evaluate_interests.py --quiet 2>&1)

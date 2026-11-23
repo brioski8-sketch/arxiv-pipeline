@@ -1,14 +1,16 @@
 #!/bin/bash
-# Cron wrapper: update arxiv DB -> refresh influential/most-cited -> generate report.
+# Cron wrapper: update arxiv DB -> generate report.
 #
-# HARD BUDGET: cron.script_timeout_seconds = 600 in config.yaml. The whole
+# The influential (most-cited) channel is NOT here: it runs on its own Tuesday
+# job (run_arxiv_influential.sh) so it gets a clean arXiv request budget.
+#
+# HARD BUDGET: cron.script_timeout_seconds = 1200 in config.yaml. The whole
 # wrapper must finish inside that, so every step is individually bounded and a
 # slow/throttled step can NEVER take the report down with it. `timeout` exits
 # 124 when it fires — reported below rather than silently swallowed.
 #
-# Order is deliberate and must not change: update_influential.py runs straight
-# after the fresh pull so generate_report.py can rank the new papers by citation
-# impact in the same run.
+# Order: pull -> report. The influential (most-cited) channel used to run here
+# and was moved to its own Tuesday job — see the note below.
 #
 # `python3 -u` everywhere: Python block-buffers stdout when redirected, so the
 # logs used to sit at 0 bytes during a hang and the failure looked silent.
@@ -17,29 +19,29 @@
 # MAILTO constants in each script). Override with ARXIV_MAILTO=you@example.com.
 cd "$HOME/.hermes/datasets/arxiv"
 
-PULL_LOG=/tmp/arxiv_pull_log.txt
-INFL_LOG=/tmp/arxiv_influential_log.txt
-REPORT_LOG=/tmp/arxiv_report_log.txt
+LOG_DIR="$HOME/.hermes/logs/arxiv"
+mkdir -p "$LOG_DIR"
+DAY=$(date +%F)
+PULL_LOG="$LOG_DIR/pull_$DAY.log"
+REPORT_LOG="$LOG_DIR/report_$DAY.log"
 
 # Step 1: Pull new papers (~28 queries, 3.5s apart; aborts early if arXiv stays down).
-#         Budget 270s vs the script's own 240s PULL_TIME_BUDGET, so retries are
+#         Budget 660s vs the script's own 600s PULL_TIME_BUDGET, so retries are
 #         clamped by the script and `timeout` stays the outer backstop.
-timeout 270 python3 -u update_arxiv.py > "$PULL_LOG" 2>&1
+timeout 660 python3 -u update_arxiv.py > "$PULL_LOG" 2>&1
 PULL_STATUS=$?
 
 # arXiv ToU: "no more than one request every three seconds" applies across ALL
-# of this client's requests, not per-script. Each script spaces its own queries,
-# but the handoff from step 1 to step 1b is still a back-to-back pair — wait it
-# out here so the collective rate never dips below the limit.
-sleep 5
+# of this client's requests. The influential channel now runs on its own day,
+# so the pull hands straight off to the report (OpenAlex, not arXiv).
 
-# Step 1b: Influential (most-cited) papers for the fresh batch. Self-skips if
-# run <7 days ago; self-bounds to TIME_BUDGET internally.
-timeout 180 python3 -u update_influential.py > "$INFL_LOG" 2>&1
-INFL_STATUS=$?
+# Step 1b (influential/most-cited) is NOT here any more. arXiv's limit is
+# per-IP and collective: starting it 5 s after this pull guaranteed 429s, so it
+# never finished and re-did the same queries weekly. It now runs on its own
+# Tuesday job (run_arxiv_influential.sh) with a clean budget.
 
 # Step 2: Generate the scored report — runs even if 1/1b were killed above.
-timeout 120 python3 -u generate_report.py > "$REPORT_LOG" 2>&1
+timeout 360 python3 -u generate_report.py > "$REPORT_LOG" 2>&1
 REPORT_STATUS=$?
 
 # Step 3: Read the short report and combine with summary
@@ -66,7 +68,7 @@ PULL_FAILED=${PULL_FAILED:-0}
 
 echo "=== Arxiv Pipeline Run: $(date) ==="
 echo "Pull:        $(status_note "$PULL_STATUS") -- $(tail -1 "$PULL_LOG" 2>/dev/null)"
-echo "Influential: $(status_note "$INFL_STATUS") -- $(tail -1 "$INFL_LOG" 2>/dev/null)"
+echo "Influential: moved to its own Tuesday job (clean arXiv budget)"
 echo "Report:      $(status_note "$REPORT_STATUS") -- $(tail -1 "$REPORT_LOG" 2>/dev/null)"
 echo ""
 if [ "$PULL_FAILED" -gt 0 ] || [ "$PULL_STATUS" -ne 0 ]; then
