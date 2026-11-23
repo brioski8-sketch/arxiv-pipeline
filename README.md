@@ -9,7 +9,8 @@ feeding a podcast stream.
 |---|---|
 | `arxiv/update_arxiv.py` | Pull new papers by query from arXiv |
 | `arxiv/update_influential.py` | Churn top-cited papers per topic via OpenAlex citation enrichment |
-| `arxiv/generate_report.py` | Build the daily briefing report |
+| `arxiv/openalex_client.py` | Shared OpenAlex lookup — 50 DOIs per request, maps published DOIs back to arXiv ids |
+| `arxiv/generate_report.py` | Build the weekly briefing report |
 | `arxiv/deep_dive.py` | Weekly deep dive on a single paper (full-text PDF extraction) |
 | `arxiv/evaluate_interests.py` | Evaluate interest-category effectiveness (Jev-gated) |
 | `arxiv/regenerate_report_checks.py` | Checks for report regeneration |
@@ -38,7 +39,8 @@ degrades to "no vault candidates" rather than reaching into someone's cloud driv
 
 ## Runners
 
-- `scripts/run_arxiv_pipeline.sh`
+- `scripts/run_arxiv_pipeline.sh` — pull + report (Monday)
+- `scripts/run_arxiv_influential.sh` — influential/most-cited channel (Tuesday)
 - `scripts/run_arxiv_deep_dive.sh`
 - `scripts/run_arxiv_eval.sh`
 - `scripts/build_arxiv_db.py`
@@ -49,8 +51,24 @@ degrades to "no vault candidates" rather than reaching into someone's cloud driv
 | Job | Schedule |
 |---|---|
 | Pipeline + podcast | Mon 09:00 |
+| Influential channel | Tue 08:00 |
 | Deep dive | Sun 07:00 |
 | Interest evaluator | 1st and 15th, 06:00 |
+
+**The influential channel runs on its own day on purpose.** arXiv's rate limit is per-IP and
+collective: starting ten relevance queries seconds after the 28-query pull put every request on
+an exhausted budget, so it 429'd, never finished, and retried the same work weekly for months.
+A separate Tuesday run gets a clean budget. The script deliberately does not stamp its marker on
+a partial enrichment, so check `.last_influential` before assuming the channel is alive.
+
+The two agent-facing jobs read their instructions from `cronprompts/arxiv-pipeline.md` and
+`cronprompts/arxiv-deep-dive.md`; edit those files, not the cron job.
+
+## Logs
+
+Every step writes to `~/.hermes/logs/arxiv/` (`pull_<date>.log`, `report_<date>.log`,
+`influential_<date>.log`, `interest_eval.log`). They used to live in `/tmp` and a pruned
+scratch dir, which is how a three-month failure stayed invisible.
 
 ## The reporting window — read before touching a date filter
 
